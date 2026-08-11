@@ -16,12 +16,12 @@
 | ----------------------- | ------------------ |
 | Sodium                  | ✅(0.9.1)          |
 | Iris                    | ✅(1.11.2)         |
-| Distant Horizons        | X(3.2.0-b)        |
+| Distant Horizons        | X(3.2.0-b)         |
 | Xaero's Minimap         | ✅(26.4.2)         |
 | Xaero's World Map       | ✅(1.44.2)         |
 | JourneyMap              | ✅(6.0.4)          |
 | Create                  | ✅(fly-6.0.9-1)    |
-| Voxy                    | ✅(0.2.18)         |
+| Voxy                    | X(0.2.18)          |
 | Jade                    | ✅(26.2.10)        |
 | Inventory HUD+.         | ✅(3.4.32)         |
 
