@@ -23,7 +23,8 @@
 | Create                  | ✅(fly-6.0.9-1)    |
 | Voxy                    | X(0.2.18)          |
 | Jade                    | ✅(26.2.10)        |
-| Inventory HUD+.         | ✅(3.4.32)         |
+| Inventory HUD+          | ✅(3.4.32)         |
+| Just Enough Items       | ✅(30.18.0.146)    |
 
 ## Shaderpack compatibility
 
