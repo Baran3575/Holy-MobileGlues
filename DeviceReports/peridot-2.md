@@ -21,7 +21,9 @@
 | Xaero's World Map       | ✅(1.44.2)         |
 | JourneyMap              | ✅(6.0.4)          |
 | Create                  | ✅(fly-6.0.9-1)    |
-| Voxy.                   | ✅(0.2.18)         |
+| Voxy                    | ✅(0.2.18)         |
+| Jade                    | ✅(26.2.10)        |
+| Inventory HUD+.         | ✅(3.4.32)         |
 
 ## Shaderpack compatibility
 
