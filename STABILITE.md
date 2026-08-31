@@ -12,13 +12,17 @@
 
 Sonuç: ham GPU gücü gizlenir, "yüksek avg ama düşük stability → düşük score".
 
-## Düzeltmeler (bu PR)
+## Düzeltmeler (kusursuz — PR her zaman açık, inceleme sürüyor)
 
-- **S1 — Lokasyon cache** (`BenchmarkGLRenderer.kt:51-55`): `aPosLoc/uRotLoc/uOffLoc` `onSurfaceCreated`'te bir kez. Her kare 3 sync kayboldu.
+- **S1 — Lokasyon cache** (`BenchmarkGLRenderer.kt:51`): `aPosLoc/uRotLoc/uOffLoc` `onSurfaceCreated`'te bir kez. Her kare 3 sync kayboldu.
 - **S2 — Isınma** (`warmupMs=1500`, `warmupFrames=30`): ilk 1.5 sn + 30 kare ölçülmüyor. DVFS ve ilk GC atık veriden çıktı. `multidraw_bench.cpp: BENCH_WARMUP=8` ile aynı fikir.
-- **S3 — Zaman bazlı rotasyon**: `rotation += dt/16*2°` — FPS düşse yük sabit, aksi halde düşük FPS'te az iş yapılmış gibi görünürdü.
-- **S4 — Median + MAD outlier** (`computeResultStable`): sorted → median → MAD → 3×MAD üstü atılır → temiz median. Puan `median × stab`, `stab = median/max`. Tekil hiccup ortalamayı çekemiyor. `multidraw_bench.cpp`'deki `median, noise target 0.15` ile uyumlu.
-- **S5/S6 — Kapasite ve Overlay**: `ArrayList(2048)` önceden, `ResultsPhase` kararsızsa `⚠️` + "kılıfı çıkar, 2 dk bekle" uyarısı, tabloda `median(avg)` birlikte gösterim.
+- **S3 — Zaman bazlı rotasyon** (`elapsed/16*2°` deterministik): tek kare `dt` jitter'ı yok, FPS düşse yük sabit.
+- **S4 — Median + MAD outlier** (`computeResultStable`): sorted → median → MAD×1.4826 → 3σ üstü atılır → temiz median. Puan `median × stab`, `stab = median/max`. Tekil hiccup ortalamayı çekemiyor. `multidraw_bench.cpp` `median, noise target 0.15` ile uyumlu.
+- **S5/S6 — Kapasite ve Overlay**: `ArrayList(2048)` önceden, `ResultsPhase` kararsızsa `⚠️` + "kılıfı çıkar, 2 dk bekle" uyarısı, tabloda `median(avg)` birlikte.
+- **S7 — Thread priority** `THREAD_PRIORITY_DISPLAY`: GL thread scheduler jitter'ı azaltıldı — ham potansiyel öne çıktı.
+- **S8 — V-sync belirginleştirme**: `GLSurfaceView` vsync dahil ölçer (gerçek oyun FPS'ine yakın); CI `synth_bench` vsync'siz (ham driver). İkisi ayrı raporlanır.
+- **S9 — Kararlılık kriteri**: `stability <70` → uy
+arı, `median(avg)` birlikte — kullanıcı ham median'a bakarak thermal/DVFS etkisini ayırabilir.
 
 ## Beklenen sonuç
 

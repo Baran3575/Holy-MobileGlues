@@ -1,16 +1,16 @@
 /*
- * Holy MobileGlues — BenchmarkGLRenderer (stabilite revizyonu)
+ * Holy MobileGlues — BenchmarkGLRenderer (kusursuz stabilite)
  * Kaynak: Star1xr/ZalithLauncher2Plus BenchmarkGLRenderer.kt:15 (149 satır)
- * Stabilite odaklı düzeltmeler — ham performansı açığa çıkarmak için jitter kaynakları ayıklandı.
+ * Ham GPU potansiyelini gizleyen her jitter ayıklandı — inceleme her zaman açık, kusursuz olana kadar revize.
  *
  * Değişiklikler vs Plus:
- *  - [S1] Uniform/attrib lokasyonları her kare sorgulanıyordu → cache (glGet* her çizimde driver sync)
- *  - [S2] Isınma (warmup) yoktu → ilk 1500 ms + 30 kare ölçülmüyor (DVFS ramp, shader compile, GC)
- *  - [S3] rotation sabitti (frame başına 2°) → zaman bazlı (düşük FPS'de aynı yük korunur)
- *  - [S4] computeResult: mean yerine median temelli, outliers MAD ile ayıklanıyor, p99/median/noise rapor
- *  - [S5] V-sync / compositor jitter için EGL swap interval notu; GLSurfaceView zaten CONTINUOUSLY
- *  - [S6] FrameTimes kapasitesi önceden ayrıldı (GC duraklaması azaltma)
- * Ham draw-call maliyeti dışında hiçbir şey ölçülmemeli — bu düzeltmeler ham potansiyeli ortaya çıkarır.
+ *  - [S1] Uniform/attrib lokasyon cache (glGet* her kare sync → 0)
+ *  - [S2] Isınma 1500 ms + 30 kare (DVFS ramp, shader compile, GC atık veri dışı)
+ *  - [S3] Zaman bazlı rotasyon (elapsed'e göre deterministik, tek kare dt jitter'ı yok)
+ *  - [S4] Median+MAD outlier (3×MAD, MAD×1.4826 → σ), puan = median×stab, noise = 100-stab
+ *  - [S5] V-sync notu + [S7] THREAD_PRIORITY_DISPLAY + [S8] surface lifecycle güvenli
+ *  - [S6] ArrayList(2048) + [S9] deterministik grid (col/row sabit, allocation yok)
+ *  Ölçülen tek şey ham draw-call maliyeti — gerisi stabilite gürültüsü değil.
  */
 
 package com.holy.mobileglues.benchmark
@@ -81,6 +81,8 @@ class BenchmarkGLRenderer(
     """.trimIndent()
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+        // [S7] Kusursuz: GL thread önceliği — scheduler jitter'ı azalt, ham potansiyel öne çıksın
+        try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY) } catch (_: Throwable) {}
         GLES20.glClearColor(0.08f, 0.08f, 0.12f, 1f)
         programId = compileProgram()
         vboId = makeQuadVBO()
@@ -88,6 +90,9 @@ class BenchmarkGLRenderer(
         aPosLoc = GLES20.glGetAttribLocation(programId, "aPos")
         uRotLoc = GLES20.glGetUniformLocation(programId, "uRot")
         uOffLoc = GLES20.glGetUniformLocation(programId, "uOff")
+        // [S8] V-sync not: GLSurfaceView RENDERMODE_CONTINUOUSLY vsync'e takılır — gerçek ham potansiyel
+        // vsync kapalı ölçüm için EGL14.eglSwapInterval(eglDisplay, 0) gerekir ama GLSurfaceView'da erişim yok;
+        // bu bench vsync dahil FPS'i ölçer (cihazın gerçek oyun FPS'ine yakın). CI synthetic bench vsync'sizdir.
         startNanos = System.nanoTime()
         lastNanos = 0L
         frameTimes.clear()
@@ -125,11 +130,10 @@ class BenchmarkGLRenderer(
             return
         }
 
-        // [S3] Zaman bazlı rotasyon — FPS düşse de sahne aynı hızda döner, yük sabit
-        // Önce 2°/frame idi; şimdi dt'ye göre ~120°/sn (60 FPS'te 2°/frame ile aynı)
-        // dt yoksa ilk kare fallback 2°
-        val dtMs = if (frameTimes.isEmpty()) 16.0 else frameTimes.lastOrNull()?.let { it / 1_000_000.0 } ?: 16.0
-        rotation = (rotation + (dtMs / 16.0 * 2.0).toFloat()) % 360f
+        // [S3] Zaman bazlı rotasyon — elapsed'e göre, tek kare dt jitter'ından arındırılmış
+        // Önce 2°/frame, sonra lastFrame dt ile idi; şimdi toplam elapsed ile deterministik — ham yük sabit
+        val elapsedMsForRot = (now - startNanos) / 1_000_000.0
+        rotation = ((elapsedMsForRot / 16.0 * 2.0) % 360.0).toFloat()
 
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         GLES20.glUseProgram(programId)

@@ -60,13 +60,28 @@ import androidx.compose.ui.viewinterop.AndroidView
  * Holy'nin renderer soyutlaması. MobileGlues-plugin'de RendererInterface yok;
  * plugin tek renderer (libmobileglues.so). Karşılaştırma için ANGLE açık/kapalı
  * veya farklı MobileGlues sürümleri HolyRenderer olarak eklenir.
+ *
+ * OpenGL + OpenGL-over-Vulkan için: RendererBackend → HolyRenderer dönüşümü
+ * `RendererSystem.enumerate()` ile otomatik — Direct GLES her cihazda, ANGLE Vulkan varsa eklenir.
  */
 data class HolyRenderer(
     val name: String,
     val summary: String? = null,
-    // İsteğe bağlı: bu renderer'ı uygulayacak env (örn. "LIBGL_ES=3:MG_ANGLE=1")
+    // İsteğe bağlı: bu renderer'ı uygulayacak env (örn. "MG_ANGLE_DIR=/data/app/.../lib/arm64")
     val env: Map<String, String> = emptyMap(),
-)
+    // Kusursuz: backend tipi — Direct mi ANGLE Vulkan mı? (karşılaştırma başlığı için)
+    val backendId: String = "direct_gles",
+) {
+    companion object {
+        /** RendererBackend → HolyRenderer — OpenGL / OpenGL-over-Vulkan ikilisi */
+        fun fromBackend(backend: com.holy.mobileglues.renderer.RendererBackend): HolyRenderer =
+            HolyRenderer(name = backend.displayName, summary = backend.summary, env = backend.toEnv(), backendId = backend.id)
+
+        /** Context'ten otomatik liste — her cihazda en az 1, ANGLE varsa 2 */
+        fun autoList(context: android.content.Context): List<HolyRenderer> =
+            com.holy.mobileglues.renderer.RendererSystem.enumerate(context).map { fromBackend(it) }
+    }
+}
 
 data class HolyBenchmarkResult(
     val rendererName: String,
