@@ -1,0 +1,94 @@
+name: Build — Holy MobileGlues (APK)
+
+# MobileGlues-plugin mg.yml + Zalith build.yml birleşimi, Holy fork için.
+# Local build yok — tüm derleme Actions'te.
+# Hedefler:
+#  - MobileGlues core (C++20 + CMake 3.22 + NDK 27.3) → libmobileglues.so
+#  - Plugin APK (Compose + MIUix + Gradle) → MobileGlues-plugin.apk
+# Repo şu an docs-only (release fork) olduğu için renderer kaynakları yoksa
+# workflow skip eder (yeşil). Renderer eklendiğinde (git submodule add ...) otomatik aktif.
+
+on:
+  push:
+    branches: ["main", "dev"]
+  pull_request:
+    branches: ["main", "dev"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Detect renderer
+        id: detect
+        run: |
+          HAS_RENDERER=false
+          if [ -f "MobileGlues-cpp/CMakeLists.txt" ] || [ -f "app/build.gradle.kts" ] || [ -f "MobileGlues/build.gradle.kts" ]; then HAS_RENDERER=true; fi
+          # Holy henüz docs-only ise has_renderer=false
+          echo "has_renderer=$HAS_RENDERER" >> $GITHUB_OUTPUT
+          echo "has_renderer=$HAS_RENDERER"
+          if [ "$HAS_RENDERER" = "false" ]; then
+            echo "::notice::Renderer sources not found — docs-only fork, APK build skipped. Add MobileGlues core via: git submodule add https://github.com/MobileGL-Dev/MobileGlues MobileGlues && git submodule add https://github.com/MobileGL-Dev/MobileGlues-plugin app (veya RENDERER_BOOTSTRAP.md'e bakın)"
+          fi
+
+      - name: Set current date
+        if: steps.detect.outputs.has_renderer == 'true'
+        run: echo "date_today=$(date +'%Y-%m-%d')" >> $GITHUB_ENV
+
+      - name: Set repo name
+        if: steps.detect.outputs.has_renderer == 'true'
+        run: echo "repository_name=$(echo '${{ github.repository }}' | awk -F '/' '{print $2}')" >> $GITHUB_ENV
+
+      - name: Set up JDK 17
+        if: steps.detect.outputs.has_renderer == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 17
+          cache: gradle
+
+      - name: Setup Android SDK
+        if: steps.detect.outputs.has_renderer == 'true'
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK 27.3.13750724
+        if: steps.detect.outputs.has_renderer == 'true'
+        run: |
+          echo "y" | sdkmanager "ndk;27.3.13750724" || sdkmanager --install "ndk;27.3.13750724"
+          echo "ndk.dir=$ANDROID_HOME/ndk/27.3.13750724" >> local.properties
+          cat local.properties
+
+      - name: Setup Gradle
+        if: steps.detect.outputs.has_renderer == 'true'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Grant execute permission for gradlew
+        if: steps.detect.outputs.has_renderer == 'true'
+        run: chmod +x ./gradlew
+
+      - name: Build APK
+        if: steps.detect.outputs.has_renderer == 'true'
+        run: ./gradlew assembleRelease --stacktrace
+        env:
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+
+      - name: Upload APK
+        if: steps.detect.outputs.has_renderer == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.repository_name }}_${{ env.date_today }}_${{ github.sha }}
+          path: app/build/outputs/apk/release/
+          if-no-files-found: warn
+
+      - name: Validate docs (always)
+        run: |
+          echo "Validating markdown..."
+          npm i -g prettier 2>&1 | tail -n 5
+          npx prettier --check . || echo "::warning::Prettier check failed — format-pull-request will auto-fix on PR"

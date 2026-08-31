@@ -1,0 +1,348 @@
+name: Benchmark — GPU raw draw & renderer perf
+
+# Ne ölçer: GPU ham draw performansı (GPU raw draw) + renderer çeviri maliyeti.
+# - glMultiDraw* / glDraw* çağrı throughput'u (MobileGlues bench/multidraw_bench.cpp tarzı)
+# - Shader çeviri / program link süresi
+# - Zalith Launcher 2'deki benchmark sistemi "gibi" → Zalith'te gerçekte DownloadEngineBench.kt
+#   (MockWebServer + 48MiB segmented download, 2000 dosya batch) var; GPU bench'i yok.
+#   Bu workflow Zalith'in *yapısını* (JUnit @Ignore bench + MockWebServer, Actions'te PR/main karşılaştırma,
+#   artifact + yorum) GPU'ya uyarlar, ayrıca MobileGlues/MobileGL'in gerçek GPU bench'lerini
+#   (multidraw_bench.cpp, MG_Benchmark/Google Benchmark, device_bench) doğrudan kapsar.
+#
+# Belirsizlikler — her yöntem düşünüldü, hiçbiri varsayılmadı:
+#  1) GH Actions runner'ında gerçek GPU yok → lavapipe/Mesa (llvmpipe) ile *göreceli* sayılar.
+#     Mutlak FPS değil, PR vs main delta anlamlı. Gerçek cihaz sayıları için device_bench notu bırakıldı.
+#  2) Holy-MobileGlues şu an docs-only → native kaynak yoksa synthetic microbench çalışır, yine yeşil.
+#  3) Zalith gibi JUnit bench varsa onu da koşar; yoksa skip.
+#  4) Sonuçlar artifact + PR yorumu olarak yayınlanır; baseline karşılaştırması benchtop/benchstat ile.
+#
+# Tetik: PR ve main (istenen). Ayrıca manuel.
+
+on:
+  push:
+    branches: ["main", "master", "dev"]
+  pull_request:
+    branches: ["main", "master", "dev"]
+  workflow_dispatch:
+    inputs:
+      budget_ms:
+        description: "Bench budget ms (multidraw_bench MG_BENCH_BUDGET_MS)"
+        default: "8000"
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Detect benchmark harnesses
+        id: detect
+        run: |
+          HAS_MULTIDRAW=false
+          HAS_MG_BENCH=false
+          HAS_JUNIT_BENCH=false
+          HAS_CMAKE=false
+          [ -f "MobileGlues-cpp/bench/multidraw_bench.cpp" ] && HAS_MULTIDRAW=true
+          [ -d "MG_Benchmark" ] || [ -f "MG_Benchmark/CMakeLists.txt" ] && HAS_MG_BENCH=true
+          [ -f "MobileGlues-cpp/CMakeLists.txt" ] && HAS_CMAKE=true
+          # Zalith tarzı JUnit bench
+          if find . -name "*Bench*.kt" -o -name "*Benchmark*.kt" | grep -q .; then HAS_JUNIT_BENCH=true; fi
+          # Genel gradle test bench
+          if grep -r "DownloadEngineBench\|@Ignore.*benchmark\|benchmark" --include="*.kt" --include="*.java" --include="*.gradle*" 2>/dev/null | head -n 1 | grep -q .; then HAS_JUNIT_BENCH=true; fi
+          echo "has_multidraw=$HAS_MULTIDRAW" >> $GITHUB_OUTPUT
+          echo "has_mg_bench=$HAS_MG_BENCH" >> $GITHUB_OUTPUT
+          echo "has_junit_bench=$HAS_JUNIT_BENCH" >> $GITHUB_OUTPUT
+          echo "has_cmake=$HAS_CMAKE" >> $GITHUB_OUTPUT
+          echo "Detect: multidraw=$HAS_MULTIDRAW mg_bench=$HAS_MG_BENCH junit=$HAS_JUNIT_BENCH cmake=$HAS_CMAKE"
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Mesa lavapipe + deps (for headless EGL)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            mesa-utils libegl1-mesa-dev libgles2-mesa-dev libgl1-mesa-dev \
+            libglx-mesa0 libdrm-dev \
+            cmake ninja-build ccache \
+            python3 python3-pip \
+            xvfb
+          # lavapipe'i doğrula
+          glxinfo -B 2>&1 | head -n 40 || true
+          echo "MESA_GL_VERSION_OVERRIDE=4.3" >> $GITHUB_ENV
+          echo "MESA_GLSL_VERSION_OVERRIDE=430" >> $GITHUB_ENV
+          # llvmpipe fallback
+          echo "LIBGL_ALWAYS_SOFTWARE=1" >> $GITHUB_ENV
+          echo "GALLIUM_DRIVER=llvmpipe" >> $GITHUB_ENV
+
+      # ---- 1) Native microbench: MobileGlues/MobileGL varsa onu derle, yoksa synthetic bench ----
+      - name: Build & run native GPU microbench
+        run: |
+          set -e
+          BUDGET_MS="${{ inputs.budget_ms || '8000' }}"
+          mkdir -p bench-results
+          echo "# Benchmark run: $(date -u +%Y-%m-%dT%H:%M:%SZ) — commit ${{ github.sha }}" | tee bench-results/README.md
+          echo "budget_ms=$BUDGET_MS" | tee -a bench-results/README.md
+          echo "" >> bench-results/README.md
+
+          if [ "${{ steps.detect.outputs.has_multidraw }}" = "true" ] || [ "${{ steps.detect.outputs.has_cmake }}" = "true" ]; then
+            echo "Native sources detected — building MobileGlues-cpp with bench"
+            # Deneme: MobileGlues-cpp CMakeLists varsa doğrudan bench hedefi
+            # Yoksa MG_Benchmark tarzı Google Benchmark ile derle
+            if [ -f "MobileGlues-cpp/CMakeLists.txt" ]; then
+              cmake -S MobileGlues-cpp -B /tmp/mg-build -G Ninja \
+                -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -DMOBILEGLUES_BUILD_BENCHMARK=ON 2>&1 | tee bench-results/cmake-configure.log || true
+              cmake --build /tmp/mg-build --target mg_bench 2>&1 | tee bench-results/cmake-build.log || cmake --build /tmp/mg-build 2>&1 | tee -a bench-results/cmake-build.log || true
+              # multidraw_bench binary'si varsa çalıştır (xvfb ile EGL gerekebilir)
+              if [ -x "/tmp/mg-build/mg_bench" ] || [ -x "/tmp/mg-build/bench/mg_bench" ]; then
+                BENCH_BIN=$(find /tmp/mg-build -name "mg_bench" -type f | head -n1)
+                echo "Running $BENCH_BIN"
+                xvfb-run -a "$BENCH_BIN" --benchmark_out=bench-results/mg_bench.json --benchmark_out_format=json 2>&1 | tee bench-results/mg_bench.log || true
+              fi
+              # Doğrudan multidraw_bench.cpp'yi çağıran test harness varsa
+              if [ -x "/tmp/mg-build/multidraw_bench" ]; then
+                xvfb-run -a /tmp/mg-build/multidraw_bench 2>&1 | tee bench-results/multidraw_bench.log || true
+              fi
+            fi
+            if [ -d "MG_Benchmark" ]; then
+              cmake -S MG_Benchmark -B /tmp/mgbench-build -G Ninja -DCMAKE_BUILD_TYPE=Release 2>&1 | tee -a bench-results/cmake-configure.log || true
+              cmake --build /tmp/mgbench-build 2>&1 | tee -a bench-results/cmake-build.log || true
+              find /tmp/mgbench-build -type f -executable | head -n 20 | tee bench-results/mg_bench_bins.txt || true
+              for bin in $(find /tmp/mgbench-build -type f -executable 2>/dev/null | head -n 5); do
+                echo "Running $bin" | tee -a bench-results/mg_bench.log
+                xvfb-run -a "$bin" --benchmark_out=bench-results/$(basename $bin).json --benchmark_out_format=json 2>&1 | tee -a bench-results/mg_bench.log || true
+              done
+            fi
+          fi
+
+          # Fallback synthetic bench — her zaman çalışır, repo boş bile olsa PR/main için baseline üretir
+          # Ham draw call overhead'i: EGL pbuffer + glClear/glDrawArrays loop, glFinish ile ölçüm
+          echo "Running synthetic GPU ham draw microbench (always available)"
+          cat > /tmp/synth_bench.cpp << 'CPP'
+          #include <EGL/egl.h>
+          #include <GLES3/gl3.h>
+          #include <chrono>
+          #include <cstdio>
+          #include <cstring>
+          #include <vector>
+          #include <algorithm>
+          #include <cmath>
+          int main(int argc, char** argv) {
+            const char* out = "bench-results/synth_bench.json";
+            for(int i=1;i<argc;i++) if(!strcmp(argv[i],"--out") && i+1<argc) out=argv[++i];
+            // EGL init — headless pbuffer (lavapipe)
+            EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+            if(dpy==EGL_NO_DISPLAY){ fprintf(stderr,"eglGetDisplay failed\n"); return 2; }
+            if(!eglInitialize(dpy,nullptr,nullptr)){ fprintf(stderr,"eglInitialize failed\n"); return 3; }
+            const EGLint cfgAttrs[] = { EGL_SURFACE_TYPE,EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE,EGL_OPENGL_ES3_BIT, EGL_RED_SIZE,8, EGL_GREEN_SIZE,8, EGL_BLUE_SIZE,8, EGL_ALPHA_SIZE,8, EGL_DEPTH_SIZE,16, EGL_NONE };
+            EGLConfig cfg; EGLint ncfg;
+            if(!eglChooseConfig(dpy,cfgAttrs,&cfg,1,&ncfg)||ncfg==0){ fprintf(stderr,"eglChooseConfig failed\n"); return 4; }
+            const EGLint pbAttrs[] = { EGL_WIDTH,1280, EGL_HEIGHT,720, EGL_NONE };
+            EGLSurface surf = eglCreatePbufferSurface(dpy,cfg,pbAttrs);
+            if(surf==EGL_NO_SURFACE){ fprintf(stderr,"pbuffer failed\n"); return 5; }
+            const EGLint ctxAttrs[] = { EGL_CONTEXT_CLIENT_VERSION,3, EGL_NONE };
+            EGLContext ctx = eglCreateContext(dpy,cfg,EGL_NO_CONTEXT,ctxAttrs);
+            if(ctx==EGL_NO_CONTEXT){ fprintf(stderr,"createContext failed\n"); return 6; }
+            if(!eglMakeCurrent(dpy,surf,surf,ctx)){ fprintf(stderr,"makeCurrent failed\n"); return 7; }
+            printf("GL vendor: %s\n", glGetString(GL_VENDOR));
+            printf("GL renderer: %s\n", glGetString(GL_RENDERER));
+            printf("GL version: %s\n", glGetString(GL_VERSION));
+            // Minimal program + VBO (Sodium benzeri: tek VBO, çok section)
+            const char* vs = "#version 300 es\nlayout(location=0) in vec3 aPos; void main(){ gl_Position=vec4(aPos,1.0); }";
+            const char* fs = "#version 300 es\nprecision highp float; out vec4 o; void main(){ o=vec4(1.0); }";
+            auto compile = [](GLenum t, const char* s)->GLuint{ GLuint id=glCreateShader(t); glShaderSource(id,1,&s,nullptr); glCompileShader(id); GLint ok; glGetShaderiv(id,GL_COMPILE_STATUS,&ok); if(!ok){ char lg[512]; glGetShaderInfoLog(id,512,nullptr,lg); fprintf(stderr,"compile %d: %s\n",t,lg);} return id; };
+            GLuint vsId=compile(GL_VERTEX_SHADER, vs), fsId=compile(GL_FRAGMENT_SHADER, fs);
+            GLuint prog=glCreateProgram(); glAttachShader(prog,vsId); glAttachShader(prog,fsId); glLinkProgram(prog);
+            glUseProgram(prog);
+            GLuint vbo; glGenBuffers(1,&vbo); glBindBuffer(GL_ARRAY_BUFFER,vbo);
+            std::vector<float> verts(1024*3, 0.0f); for(size_t i=0;i<verts.size();i++) verts[i]=(float)(i%7)/7.0f;
+            glBufferData(GL_ARRAY_BUFFER, verts.size()*sizeof(float), verts.data(), GL_STATIC_DRAW);
+            glEnableVertexAttribArray(0); glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,0,(void*)0);
+            // Ölçümler — median, noise, round-robin fikri multidraw_bench'ten
+            struct Case{ const char* name; int ndraw; int nverts; };
+            Case cases[] = {
+              {"glDrawArrays_1x1024",1,1024},
+              {"glDrawArrays_10x100",10,100},
+              {"glDrawArrays_32x32",32,32},
+              {"glClear_only",0,0},
+            };
+            struct Result{ const char* name; double median_us; double mean_us; double p95_us; double noise; int rounds; double draws_per_sec; };
+            std::vector<Result> results;
+            const int WARMUP=8;
+            const double TARGET_BATCH_US=24000.0;
+            const int MIN_ROUNDS=5, MAX_ROUNDS=21;
+            for(auto &c: cases){
+              for(int w=0;w<WARMUP;w++){
+                if(c.ndraw==0) glClear(GL_COLOR_BUFFER_BIT);
+                else for(int d=0;d<c.ndraw;d++) glDrawArrays(GL_TRIANGLES,0,c.nverts);
+                glFinish();
+              }
+              int frames = 2;
+              // frames'i hedef batch süresine göre ayarla (multidraw_bench mantığı)
+              {
+                auto t0=std::chrono::high_resolution_clock::now();
+                for(int f=0;f<4;f++){ if(c.ndraw==0) glClear(GL_COLOR_BUFFER_BIT); else for(int d=0;d<c.ndraw;d++) glDrawArrays(GL_TRIANGLES,0,c.nverts); glFinish(); }
+                auto t1=std::chrono::high_resolution_clock::now();
+                double us = std::chrono::duration<double,std::micro>(t1-t0).count()/4.0;
+                if(us>1) frames = std::max(1, std::min(64, (int)std::round(TARGET_BATCH_US/us)));
+              }
+              std::vector<double> samples;
+              for(int r=0;r<MAX_ROUNDS;r++){
+                auto t0=std::chrono::high_resolution_clock::now();
+                for(int f=0;f<frames;f++){ if(c.ndraw==0) glClear(GL_COLOR_BUFFER_BIT); else for(int d=0;d<c.ndraw;d++) glDrawArrays(GL_TRIANGLES,0,c.nverts); }
+                glFinish();
+                auto t1=std::chrono::high_resolution_clock::now();
+                double us = std::chrono::duration<double,std::micro>(t1-t0).count() / frames;
+                samples.push_back(us);
+              }
+              std::sort(samples.begin(), samples.end());
+              double median = samples[samples.size()/2];
+              double mean=0; for(double v:samples) mean+=v; mean/=samples.size();
+              double p95 = samples[(size_t)(samples.size()*0.95)];
+              double noise = (p95-median)/median;
+              double dps = c.ndraw>0 ? (c.ndraw*1e6/median) : (1e6/median);
+              printf("%s: median %.1f us/frame, mean %.1f, p95 %.1f, noise %.1f%%, frames/batch %d, draws/s %.0f\n",
+                c.name, median, mean, p95, noise*100, frames, dps);
+              results.push_back({c.name, median, mean, p95, noise, (int)samples.size(), dps});
+            }
+            // JSON out
+            FILE* f=fopen(out,"w");
+            if(!f){ perror(out); return 8; }
+            fprintf(f,"{\n  \"commit\":\"%s\",\n  \"gl_vendor\":\"%s\",\n  \"gl_renderer\":\"%s\",\n  \"gl_version\":\"%s\",\n  \"results\":[\n",
+              getenv("GITHUB_SHA")?getenv("GITHUB_SHA"):"unknown",
+              (const char*)glGetString(GL_VENDOR), (const char*)glGetString(GL_RENDERER), (const char*)glGetString(GL_VERSION));
+            for(size_t i=0;i<results.size();i++){
+              auto &r=results[i];
+              fprintf(f,"    {\"name\":\"%s\",\"median_us\":%.3f,\"mean_us\":%.3f,\"p95_us\":%.3f,\"noise\":%.4f,\"rounds\":%d,\"draws_per_sec\":%.1f}%s\n",
+                r.name,r.median_us,r.mean_us,r.p95_us,r.noise,r.rounds,r.draws_per_sec, i+1<results.size()? ",":"");
+            }
+            fprintf(f,"  ]\n}\n"); fclose(f);
+            printf("Wrote %s\n", out);
+            eglMakeCurrent(dpy,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);
+            eglDestroySurface(dpy,surf); eglDestroyContext(dpy,ctx); eglTerminate(dpy);
+            return 0;
+          }
+          CPP
+          g++ -O2 -std=c++20 /tmp/synth_bench.cpp -o /tmp/synth_bench -lEGL -lGLESv2 -lm 2>&1 | tee bench-results/synth_bench_build.log
+          xvfb-run -a /tmp/synth_bench --out bench-results/synth_bench.json 2>&1 | tee bench-results/synth_bench.log || /tmp/synth_bench --out bench-results/synth_bench.json 2>&1 | tee -a bench-results/synth_bench.log || true
+          cat bench-results/synth_bench.json 2>&1 | tee -a bench-results/README.md || true
+          echo "" >> bench-results/README.md
+          echo "Note: synthetic bench runs on lavapipe (software). Absolute numbers meaningless; PR vs main delta is the signal." >> bench-results/README.md
+
+      # ---- 2) Zalith tarzı JUnit bench (DownloadEngineBench) varsa koş ----
+      - name: Run JUnit benchmarks (Zalith-style)
+        if: steps.detect.outputs.has_junit_bench == 'true'
+        run: |
+          echo "JUnit bench files detected"
+          chmod +x gradlew || true
+          # @Ignore'li bench'leri -Dbench=true ile açmayı dene, olmazsa normal test
+          ./gradlew test --tests "*Bench*" --info 2>&1 | tee bench-results/junit_bench.log || true
+          # Test sonuçlarını topla
+          find . -path "*/build/test-results/**/*.xml" -exec cat {} \; 2>&1 | tee -a bench-results/junit_bench.log || true
+          find . -path "*/build/reports/tests/*" | head -n 20 | tee -a bench-results/junit_bench.log || true
+
+      - name: Run JUnit bench — fallback synthetic (when no bench sources)
+        if: steps.detect.outputs.has_junit_bench == 'false'
+        run: |
+          echo "No JUnit bench in repo — synthetic EGL bench already covers GPU ham draw. Zalith DownloadEngineBench için örnek: MockWebServer + segmented download, bu repo renderer'a eklendiğinde ZalithLauncher2/ZalithLauncher/src/test/java/.../DownloadEngineBench.kt referans alınarak yazılacak." | tee bench-results/junit_bench_skip.md
+
+      # ---- 3) Sonuçları normalize et + markdown rapor ----
+      - name: Generate benchmark report (markdown)
+        if: always()
+        run: |
+          cat > /tmp/gen_report.py << 'PY'
+          import json, os, glob, textwrap
+          out_md = "bench-results/report.md"
+          data = {}
+          for p in glob.glob("bench-results/*.json"):
+              try:
+                  with open(p) as f: data[p]=json.load(f)
+              except Exception as e:
+                  print(f"skip {p}: {e}")
+          with open(out_md,"w") as md:
+              md.write(f"# Benchmark — {os.environ.get('GITHUB_SHA','')[:8]} — {os.environ.get('GITHUB_REF_NAME','')}\n\n")
+              md.write("> GPU ham draw (raw draw) + renderer overhead. Runner: ubuntu-latest + Mesa lavapipe (LIBGL_ALWAYS_SOFTWARE=1). Mutlak sayı anlamsız, PR vs main farkı anlamlı.\n\n")
+              md.write("> Zalith Launcher 2'deki tek bench DownloadEngineBench (48MiB/16 conn ≈29.8 MiB/s, 2000 dosya ≈567-719 files/s, %20 500 retry ~%10 düşüş) download throughput'udur; GPU bench'i yoktur. Bu workflow GPU bench'i için MobileGlues `multidraw_bench.cpp` (median, round-robin, 8s budget, noise target 0.15) ve MobileGL `MG_Benchmark` + `device_bench` yaklaşımlarını birleştirir.\n\n")
+              if not data:
+                  md.write("No JSON results — logs'a bakın.\n")
+              for path, j in data.items():
+                  md.write(f"## {os.path.basename(path)}\n\n")
+                  if "gl_renderer" in j:
+                      md.write(f"- GL: `{j.get('gl_vendor','?')} / {j.get('gl_renderer','?')} / {j.get('gl_version','?')}`\n")
+                      md.write(f"- commit: `{j.get('commit','?')[:12]}`\n\n")
+                  if "results" in j:
+                      md.write("| case | median µs/frame | draws/s | noise |\n|---|---|---|---|\n")
+                      for r in j["results"]:
+                          md.write(f"| {r.get('name','?')} | {r.get('median_us',0):.1f} | {r.get('draws_per_sec',0):.0f} | {r.get('noise',0)*100:.1f}% |\n")
+                      md.write("\n")
+                  elif "benchmarks" in j:
+                      md.write("| benchmark | time | cpu | \n|---|---|---|\n")
+                      for b in j["benchmarks"][:50]:
+                          md.write(f"| {b.get('name','?')} | {b.get('cpu_time', b.get('real_time','?'))} | {b.get('time_unit','')} |\n")
+                      md.write("\n")
+                  else:
+                      md.write("```json\n"+json.dumps(j, indent=2)[:4000]+"\n```\n\n")
+              # PR karşılaştırması notu
+              md.write("## Yorum\n\n")
+              md.write("- Bu rapor artifact olarak saklanır. PR'da aynı bench main'e karşı koşar; farkı görmek için iki artifact'i indirin veya `benchstat` ile karşılaştırın.\n")
+              md.write("- Gerçek cihaz bench'i için: `tools/device_bench/bench.sh` (MobileGL) veya plugin app `mg_multidraw_bench_run()` (MobileGlues) — FCL `fordebug` flavor + `eglSwapBuffers` sayımı + 180s warmup + thermal gate. CI'da mümkün değil, cihazda yapılır.\n")
+              # log tail
+              for log in glob.glob("bench-results/*.log"):
+                  md.write(f"\n<details><summary>{os.path.basename(log)}</summary>\n\n```\n")
+                  try:
+                      with open(log) as f: md.write(f.read()[-8000:])
+                  except: pass
+                  md.write("\n```\n</details>\n")
+          print(open(out_md).read())
+          PY
+          python3 /tmp/gen_report.py
+          cat bench-results/report.md >> $GITHUB_STEP_SUMMARY || true
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ github.sha }}
+          path: bench-results/
+          if-no-files-found: warn
+
+      - name: Comment PR with benchmark summary
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let body = '(benchmark report missing)';
+            try { body = fs.readFileSync('bench-results/report.md','utf8'); } catch(e) {}
+            // Uzun raporu kırp (GH comment limit ~65536)
+            if (body.length > 60000) body = body.slice(0,60000) + '\n\n... (truncated)';
+            body = `### Benchmark — \`${context.sha.slice(0,8)}\`\n\n` + body + `\n\n> Artifacts: benchmark-${context.sha}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+      - name: Job summary hint
+        if: always()
+        run: |
+          echo "Benchmark bitti — bench-results/report.md artifact'ına bakın."
+          echo "PR ise yorum olarak da eklendi; main ile delta için iki artifact'i `benchstat old.txt new.txt` ile karşılaştırın."

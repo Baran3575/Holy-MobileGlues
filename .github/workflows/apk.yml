@@ -1,0 +1,150 @@
+name: APK (Renderer) — No Local Build
+
+# Amaç: "build local olmayacak" — geliştirici makinesinde ./gradlew yok, sadece git push yeterli.
+# Zalith Launcher 2 build.yml + MobileGlues-plugin mg.yml birleşimi.
+# Bu workflow ayrı bir dosya olarak durur ki build.yml'den bağımsız trigger edilsin;
+# aynı zamanda build.yml içindeki build-renderer-apk job'u ile çakışmaz (farklı name).
+#
+# Olasılıklar / belirsizlikler (asla emin olma):
+#  - Holy-MobileGlues şu an docs-only (MobileGlues-release fork). Renderer C++ eklendiğinde
+#    bu workflow otomatik APK üretir; o zamana kadar graceful skip.
+#  - NDK versiyonu: MobileGlues 27.3.13750724 istiyor, Zalith JDK 17 kullanıyor — ikisi de burada.
+#  - Arch matrix: Zalith 5 arch (all/arm/arm64/x86/x86_64) yapıyor; MobileGlues-plugin tek APK.
+#    Biz ikisini de destekliyoruz: app/build.gradle.kts varsa matrix'li, yoksa tekli build.
+
+on:
+  push:
+    branches: ["main", "master", "dev"]
+  pull_request:
+    branches: ["main", "master", "dev"]
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "Build variant"
+        type: choice
+        options: [Release, Debug]
+        default: Release
+      arch:
+        description: "Arch (Zalith tarzı)"
+        type: choice
+        options: [all, arm, arm64, x86, x86_64]
+        default: all
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    strategy:
+      # Zalith gibi matrix, ama renderer tek APK ise matrix tek elemana düşer
+      matrix:
+        arch: ["all", "arm", "arm64", "x86", "x86_64"]
+      fail-fast: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Detect build system
+        id: detect
+        run: |
+          echo "arch=${{ matrix.arch }}" >> $GITHUB_OUTPUT
+          HAS_GRADLE=false
+          HAS_CMAKE=false
+          HAS_APP=false
+          [ -f "gradlew" ] && HAS_GRADLE=true
+          [ -f "MobileGlues-cpp/CMakeLists.txt" ] && HAS_CMAKE=true
+          [ -f "app/build.gradle.kts" ] || [ -f "app/build.gradle" ] && HAS_APP=true
+          # Holy-MobileGlues docs-only ise has_renderer=false → skip ama job yeşil
+          HAS_RENDERER=false
+          if [ "$HAS_CMAKE" = "true" ] || [ "$HAS_APP" = "true" ] || [ -f "MobileGlues/build.gradle.kts" ]; then HAS_RENDERER=true; fi
+          echo "has_gradle=$HAS_GRADLE" >> $GITHUB_OUTPUT
+          echo "has_cmake=$HAS_CMAKE" >> $GITHUB_OUTPUT
+          echo "has_app=$HAS_APP" >> $GITHUB_OUTPUT
+          echo "has_renderer=$HAS_RENDERER" >> $GITHUB_OUTPUT
+          echo "Detect: gradle=$HAS_GRADLE cmake=$HAS_CMAKE app=$HAS_APP renderer=$HAS_RENDERER arch=${{ matrix.arch }}"
+
+      # Odun mod (Fabric) için JDK21, renderer için JDK17 — ikisi de kurulsun, Gradle toolchain seçer
+      - name: Set up JDK 17 (renderer)
+        if: steps.detect.outputs.has_renderer == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 17
+          cache: gradle
+
+      - name: Set up JDK 21 (Fabric mod fallback)
+        if: steps.detect.outputs.has_renderer == 'false' && steps.detect.outputs.has_gradle == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+
+      - name: Setup Android SDK
+        if: steps.detect.outputs.has_renderer == 'true'
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK 27.3.13750724
+        if: steps.detect.outputs.has_renderer == 'true'
+        run: |
+          echo "y" | sdkmanager "ndk;27.3.13750724" || sdkmanager --install "ndk;27.3.13750724"
+          echo "ndk.dir=$ANDROID_HOME/ndk/27.3.13750724" >> local.properties
+          cat local.properties
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Grant execute permission for gradlew
+        if: steps.detect.outputs.has_gradle == 'true'
+        run: chmod +x gradlew
+
+      - name: Build APK — arch ${{ matrix.arch }} variant ${{ inputs.variant || 'Release' }}
+        if: steps.detect.outputs.has_renderer == 'true' && steps.detect.outputs.has_gradle == 'true'
+        run: |
+          VARIANT="${{ inputs.variant || 'Release' }}"
+          ARCH="${{ matrix.arch }}"
+          echo "Building variant=$VARIANT arch=$ARCH"
+          # Zalith tarzı: -Darch=... ile arch parametresi
+          # MobileGlues-plugin tarzı: sadece assembleRelease
+          # İkisini dene — hangisi varsa o çalışır
+          if grep -q "arch" app/build.gradle.kts 2>/dev/null || grep -q "arch" build.gradle.kts 2>/dev/null; then
+            ./gradlew "assemble${VARIANT}" -Darch="$ARCH" --stacktrace || ./gradlew assembleRelease --stacktrace
+          else
+            ./gradlew "assemble${VARIANT}" --stacktrace || ./gradlew assembleRelease --stacktrace || ./gradlew build --stacktrace
+          fi
+        env:
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+
+      - name: Build Fabric mod (fallback when no renderer)
+        if: steps.detect.outputs.has_renderer == 'false' && steps.detect.outputs.has_gradle == 'true'
+        run: ./gradlew build --stacktrace
+
+      - name: Upload APK (arch ${{ matrix.arch }})
+        if: steps.detect.outputs.has_renderer == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ matrix.arch }}-${{ github.sha }}
+          path: |
+            app/build/outputs/apk/**/*.apk
+            build/outputs/apk/**/*.apk
+            */build/outputs/apk/**/*.apk
+          if-no-files-found: warn
+
+      - name: Upload Fabric JAR (fallback)
+        if: steps.detect.outputs.has_renderer == 'false' && steps.detect.outputs.has_gradle == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mod-jar-${{ github.sha }}
+          path: |
+            build/libs/*.jar
+            !build/libs/*-sources.jar
+          if-no-files-found: warn
+
+      - name: No renderer yet — info
+        if: steps.detect.outputs.has_renderer == 'false'
+        run: |
+          echo "::notice::Renderer sources not found — APK step skipped (expected until MobileGlues C++ is added as submodule). Mod JAR was built instead."
