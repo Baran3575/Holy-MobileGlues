@@ -252,12 +252,18 @@ private fun ResultsPhase(
             HorizontalDivider()
             sorted.forEach { r ->
                 val isWinner = r.result.score == maxScore && results.size > 1
+                // Stabilite düşükse ham potansiyel gizlenmiş — kullanıcıya göster
+                val isUnstable = r.result.stabilityPct < 70
                 Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                        Text(text = r.rendererName + if (isWinner) " 🏆" else "", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text(stringResource(R.string.benchmark_score_label, r.result.score), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                        Text(text = r.rendererName + if (isWinner) " 🏆" else "" + if (isUnstable) " ⚠️" else "", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(stringResource(R.string.benchmark_score_label, r.result.score), style = MaterialTheme.typography.bodyMedium, color = if (isUnstable) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                     }
                     LinearProgressIndicator(progress = { r.result.score.toFloat() / maxScore.toFloat() }, modifier = Modifier.fillMaxWidth().height(8.dp))
+                    // Kararsızsa ham median vs min farkını göster — "cihaz performansı dalgalı" sinyali
+                    if (isUnstable) {
+                        Text("Kararlılık düşük (%${r.result.stabilityPct}) — sonuç ısınma/DVFS'ten etkilenmiş olabilir. Kılıfı çıkar, 2 dk bekle, tekrar dene.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+                    }
                 }
             }
             HorizontalDivider()
@@ -270,11 +276,12 @@ private fun ResultsPhase(
             sorted.forEach { r ->
                 Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Text(r.rendererName, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(2f), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    listOf("${r.result.avgFps}", "${r.result.minFps}", "${r.result.p99Fps}", "${r.result.stabilityPct}%").forEach { v ->
+                    listOf("${r.result.medianFps}(${r.result.avgFps})", "${r.result.minFps}", "${r.result.p99Fps}", "${r.result.stabilityPct}%").forEach { v ->
                         Text(v, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f), textAlign = TextAlign.Center)
                     }
                 }
             }
+            Text("Ort. = eski ortalama, parantez dışı = median (kararlı ham potansiyel). Kararsızlık yüksekse median'a bak.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
             Text(stringResource(R.string.benchmark_note), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline, modifier = Modifier.padding(top = 4.dp))
         }
     }
