@@ -71,20 +71,20 @@ jobs:
         if: steps.detect.outputs.has_renderer == 'true'
         run: chmod +x ./gradlew
 
-      - name: Build APK
+      - name: Build APK (arm64-v8a)
         if: steps.detect.outputs.has_renderer == 'true'
-        run: ./gradlew assembleRelease --stacktrace
+        run: ./gradlew :app:assembleRelease --stacktrace
         env:
           SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
           SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
           SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
 
-      - name: Upload APK
+      - name: Upload APK (arm64-v8a)
         if: steps.detect.outputs.has_renderer == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.repository_name }}_${{ env.date_today }}_${{ github.sha }}
-          path: app/build/outputs/apk/release/
+          name: holy-arm64-${{ github.sha }}
+          path: app/build/outputs/apk/**/arm64*.apk
           if-no-files-found: warn
 
       - name: Validate docs (always)
