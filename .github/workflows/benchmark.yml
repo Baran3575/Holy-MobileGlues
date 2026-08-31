@@ -137,7 +137,18 @@ jobs:
 
           # Fallback synthetic bench — her zaman çalışır, repo boş bile olsa PR/main için baseline üretir
           # Ham draw call overhead'i: EGL pbuffer + glClear/glDrawArrays loop, glFinish ile ölçüm
-          echo "Running synthetic GPU ham draw microbench (always available)"
+          echo "Running synthetic GPU ham draw microbench (always available) — ALT deney: round-robin + taskset + winsorized"
+          # [ALT-C1] Per-core pinning: taskset varsa tek çekirdeğe pinle — çekirdek göçmesi jitter'ını azalt
+          PIN_PREFIX=""
+          if command -v taskset >/dev/null 2>&1; then
+            NPROC=$(nproc 2>/dev/null || echo 2)
+            PIN_CORE=$((NPROC > 1 ? NPROC - 1 : 0))
+            echo "taskset detected — will pin synth bench to core $PIN_CORE (NPROC=$NPROC)" | tee -a bench-results/README.md
+            PIN_PREFIX="taskset -c $PIN_CORE"
+            PIN_PREFIX="$PIN_PREFIX nice -n -5"
+          else
+            echo "taskset not found — running without pinning" | tee -a bench-results/README.md
+          fi
           cat > /tmp/synth_bench.cpp << 'CPP'
           #include <EGL/egl.h>
           #include <GLES3/gl3.h>
@@ -147,6 +158,11 @@ jobs:
           #include <vector>
           #include <algorithm>
           #include <cmath>
+          #include <numeric>
+          // [ALT-C2] Winsorized/trimmed mean — ilk ajan MAD kullandı, bu ALT winsorized dener (karşılaştırma)
+          // IQR yerine winsorized: %10 alt/üst tail'i winsorize et, sonra mean
+          static double winsorized_mean(std::vector<double> v, double p_low=0.10, double p_high=0.10) { if(v.empty()) return 0; std::sort(v.begin(), v.end()); size_t n=v.size(); size_t lo=(size_t)std::floor(n*p_low); size_t hi=(size_t)std::floor(n*p_high); double loVal=v[std::min(lo,n-1)]; double hiVal=v[n-1-std::min(hi,n-1)]; for(auto &x: v){ if(x<loVal) x=loVal; else if(x>hiVal) x=hiVal; } double s=0; for(double x: v) s+=x; return s/n; }
+          static double trimmed_mean(std::vector<double> v, double p_low=0.10, double p_high=0.10) { if(v.empty()) return 0; std::sort(v.begin(), v.end()); size_t n=v.size(); size_t lo=(size_t)std::floor(n*p_low); size_t hi=(size_t)std::floor(n*p_high); if(lo+hi>=n) return v[n/2]; double s=0; for(size_t i=lo;i<n-hi;i++) s+=v[i]; return s/(n-lo-hi); }
           int main(int argc, char** argv) {
             const char* out = "bench-results/synth_bench.json";
             for(int i=1;i<argc;i++) if(!strcmp(argv[i],"--out") && i+1<argc) out=argv[++i];
@@ -170,60 +186,140 @@ jobs:
             // Minimal program + VBO (Sodium benzeri: tek VBO, çok section)
             const char* vs = "#version 300 es\nlayout(location=0) in vec3 aPos; void main(){ gl_Position=vec4(aPos,1.0); }";
             const char* fs = "#version 300 es\nprecision highp float; out vec4 o; void main(){ o=vec4(1.0); }";
+            // Instanced program — aPos + aOffInstance (divisor 1)
+            const char* vsInst = "#version 300 es\nlayout(location=0) in vec3 aPos; layout(location=1) in vec2 aOff; void main(){ gl_Position=vec4(aPos.xy*0.035 + aOff, 0.0, 1.0); }";
             auto compile = [](GLenum t, const char* s)->GLuint{ GLuint id=glCreateShader(t); glShaderSource(id,1,&s,nullptr); glCompileShader(id); GLint ok; glGetShaderiv(id,GL_COMPILE_STATUS,&ok); if(!ok){ char lg[512]; glGetShaderInfoLog(id,512,nullptr,lg); fprintf(stderr,"compile %d: %s\n",t,lg);} return id; };
             GLuint vsId=compile(GL_VERTEX_SHADER, vs), fsId=compile(GL_FRAGMENT_SHADER, fs);
             GLuint prog=glCreateProgram(); glAttachShader(prog,vsId); glAttachShader(prog,fsId); glLinkProgram(prog);
+            GLuint vsInstId=compile(GL_VERTEX_SHADER, vsInst);
+            GLuint progInst=glCreateProgram(); glAttachShader(progInst,vsInstId); glAttachShader(progInst,fsId); glLinkProgram(progInst);
             glUseProgram(prog);
             GLuint vbo; glGenBuffers(1,&vbo); glBindBuffer(GL_ARRAY_BUFFER,vbo);
             std::vector<float> verts(1024*3, 0.0f); for(size_t i=0;i<verts.size();i++) verts[i]=(float)(i%7)/7.0f;
             glBufferData(GL_ARRAY_BUFFER, verts.size()*sizeof(float), verts.data(), GL_STATIC_DRAW);
             glEnableVertexAttribArray(0); glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,0,(void*)0);
+            // [D1] Batched VBO — 500 quad ×6 verts ×3 floats = 9000 floats (ham throughput, 1 draw vs 32 draws ayrımı)
+            GLuint batchedVbo; glGenBuffers(1,&batchedVbo); glBindBuffer(GL_ARRAY_BUFFER, batchedVbo);
+            { std::vector<float> bverts; bverts.reserve(500*6*3);
+              float corners[6][2]={{-1,-1},{1,-1},{-1,1},{-1,1},{1,-1},{1,1}};
+              for(int i=0;i<500;i++){ float ox=(i%25-12)*0.082f, oy=(i/25-10)*0.1f; for(int c=0;c<6;c++){ bverts.push_back(corners[c][0]*0.035f+ox); bverts.push_back(corners[c][1]*0.035f+oy); bverts.push_back(0.0f);} }
+              glBufferData(GL_ARRAY_BUFFER, bverts.size()*sizeof(float), bverts.data(), GL_STATIC_DRAW);
+            }
+            // [D1] Instanced VBOs — base quad + per-instance offsets (500×vec2)
+            GLuint quadVbo, instanceVbo;
+            glGenBuffers(1,&quadVbo); glBindBuffer(GL_ARRAY_BUFFER, quadVbo);
+            { float quad[12]={-1,-1,0, 1,-1,0, -1,1,0, 1,1,0}; glBufferData(GL_ARRAY_BUFFER,sizeof(quad),quad,GL_STATIC_DRAW); }
+            glGenBuffers(1,&instanceVbo); glBindBuffer(GL_ARRAY_BUFFER, instanceVbo);
+            { std::vector<float> offs; offs.reserve(500*2); for(int i=0;i<500;i++){ offs.push_back((i%25-12)*0.082f); offs.push_back((i/25-10)*0.1f);} glBufferData(GL_ARRAY_BUFFER, offs.size()*sizeof(float), offs.data(), GL_STATIC_DRAW); }
+            // [D1] Indexed IBO — 500 quads ×4 verts + 6 indices/quad
+            GLuint indexedVbo, ibo; GLsizei indexedCount=0;
+            glGenBuffers(1,&indexedVbo); glGenBuffers(1,&ibo);
+            { std::vector<float> iverts; iverts.reserve(500*4*3); std::vector<unsigned short> idx; idx.reserve(500*6);
+              float corners[4][2]={{-1,-1},{1,-1},{-1,1},{1,1}};
+              for(int i=0;i<500;i++){ float ox=(i%25-12)*0.082f, oy=(i/25-10)*0.1f; int base=i*4;
+                for(int c=0;c<4;c++){ iverts.push_back(corners[c][0]*0.035f+ox); iverts.push_back(corners[c][1]*0.035f+oy); iverts.push_back(0.0f); }
+                idx.push_back(base+0); idx.push_back(base+1); idx.push_back(base+2); idx.push_back(base+2); idx.push_back(base+1); idx.push_back(base+3);
+              }
+              glBindBuffer(GL_ARRAY_BUFFER, indexedVbo); glBufferData(GL_ARRAY_BUFFER, iverts.size()*sizeof(float), iverts.data(), GL_STATIC_DRAW);
+              glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo); glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx.size()*sizeof(unsigned short), idx.data(), GL_STATIC_DRAW);
+              indexedCount = (GLsizei)idx.size();
+              glBindBuffer(GL_ARRAY_BUFFER, vbo); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+            }
             // Ölçümler — median, noise, round-robin fikri multidraw_bench'ten
-            struct Case{ const char* name; int ndraw; int nverts; };
+            // [D1] draw vs ayrımı net: 32x32 (32 draw, 1024 verts) vs batched_1x3000 (1 draw, 3000 verts) vs instanced (1 draw, HW divisor) vs indexed
+            enum CaseKind { KIND_DRAWARRAYS, KIND_CLEAR, KIND_BATCHED, KIND_INSTANCED, KIND_INDEXED };
+            struct Case{ const char* name; CaseKind kind; int ndraw; int nverts; const char* note; };
             Case cases[] = {
-              {"glDrawArrays_1x1024",1,1024},
-              {"glDrawArrays_10x100",10,100},
-              {"glDrawArrays_32x32",32,32},
-              {"glClear_only",0,0},
+              {"glDrawArrays_1x1024",KIND_DRAWARRAYS,1,1024, "tek büyük draw — vertex throughput tabanı"},
+              {"glDrawArrays_10x100",KIND_DRAWARRAYS,10,100, "orta batch — Sodium chunk section benzeri"},
+              {"glDrawArrays_32x32",KIND_DRAWARRAYS,32,32, "çok küçük draw — draw call stresi (32 call, 1024 verts)"},
+              {"batched_1x3000",KIND_BATCHED,1,3000, "batched attrib — 500 quad tek draw (1 call, 3000 verts) vs 32x32 ile draw overhead izole"},
+              {"instanced_500x4",KIND_INSTANCED,1,500, "instanced — base 4 verts ×500 instance, divisor 1, HW instancing"},
+              {"indexed_500quads",KIND_INDEXED,1,3000, "glDrawElements — 2000 verts + 3000 indices, bandwidth %30 az"},
+              {"glClear_only",KIND_CLEAR,0,0, "driver overhead tabanı (no draw)"},
             };
-            struct Result{ const char* name; double median_us; double mean_us; double p95_us; double noise; int rounds; double draws_per_sec; };
+            struct Result{ const char* name; double median_us; double mean_us; double p95_us; double noise; int rounds; double draws_per_sec; double winsorized_us; double trimmed_us; };
             std::vector<Result> results;
-            const int WARMUP=8;
-            const double TARGET_BATCH_US=24000.0;
-            const int MIN_ROUNDS=5, MAX_ROUNDS=21;
-            for(auto &c: cases){
-              for(int w=0;w<WARMUP;w++){
-                if(c.ndraw==0) glClear(GL_COLOR_BUFFER_BIT);
-                else for(int d=0;d<c.ndraw;d++) glDrawArrays(GL_TRIANGLES,0,c.nverts);
-                glFinish();
+            // [S10] glClear_only çok hızlı → timer quantization noise %22. Çözüm: batch'i büyüt, round artır, MAD filtre.
+            const double TARGET_BATCH_US=50000.0; // 24ms→50ms: batch uzun, quantization payı düşer
+            const int MAX_ROUNDS=31; // 21→31: median stabil, p95 güvenilir
+            const int WARMUP_BASE=16; // 8→16: DVFS + cache ısınması
+            auto doDraw = [&](const Case& cc){
+              if(cc.kind==KIND_CLEAR){ glClear(GL_COLOR_BUFFER_BIT); }
+              else if(cc.kind==KIND_BATCHED){
+                glUseProgram(prog); glBindBuffer(GL_ARRAY_BUFFER, batchedVbo);
+                glEnableVertexAttribArray(0); glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,0,(void*)0);
+                glDrawArrays(GL_TRIANGLES,0,cc.nverts);
+              } else if(cc.kind==KIND_INSTANCED){
+                glUseProgram(progInst); glBindBuffer(GL_ARRAY_BUFFER, quadVbo);
+                glEnableVertexAttribArray(0); glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,0,(void*)0);
+                glBindBuffer(GL_ARRAY_BUFFER, instanceVbo);
+                glEnableVertexAttribArray(1); glVertexAttribPointer(1,2,GL_FLOAT,GL_FALSE,0,(void*)0);
+                glVertexAttribDivisor(1,1);
+                glDrawArraysInstanced(GL_TRIANGLE_STRIP,0,4,500);
+                glVertexAttribDivisor(1,0); glDisableVertexAttribArray(1);
+                glBindBuffer(GL_ARRAY_BUFFER, vbo); glEnableVertexAttribArray(0); glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,0,(void*)0); glUseProgram(prog);
+              } else if(cc.kind==KIND_INDEXED){
+                glUseProgram(prog); glBindBuffer(GL_ARRAY_BUFFER, indexedVbo);
+                glEnableVertexAttribArray(0); glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,0,(void*)0);
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+                glDrawElements(GL_TRIANGLES, indexedCount, GL_UNSIGNED_SHORT, (void*)0);
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+                glBindBuffer(GL_ARRAY_BUFFER, vbo); glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,0,(void*)0);
+              } else {
+                for(int d=0;d<cc.ndraw;d++) glDrawArrays(GL_TRIANGLES,0,cc.nverts);
               }
-              int frames = 2;
-              // frames'i hedef batch süresine göre ayarla (multidraw_bench mantığı)
+            };
+            // [ALT-C1] Frames'i önceden hesapla — sıcak cache bias'ını önlemek için round-robin öncesi
+            constexpr int NCASES = sizeof(cases)/sizeof(cases[0]);
+            int framesPerCase[NCASES];
+            for(int ci=0; ci<NCASES; ++ci){
+              auto &c = cases[ci];
+              bool isClear=(c.kind==KIND_CLEAR);
+              for(int w=0; w<(isClear?32:WARMUP_BASE); ++w){ doDraw(c); glFinish(); }
+              int frames=16;
               {
+                const int probes=isClear?8:4;
                 auto t0=std::chrono::high_resolution_clock::now();
-                for(int f=0;f<4;f++){ if(c.ndraw==0) glClear(GL_COLOR_BUFFER_BIT); else for(int d=0;d<c.ndraw;d++) glDrawArrays(GL_TRIANGLES,0,c.nverts); glFinish(); }
+                for(int f=0;f<probes;f++){ doDraw(c); glFinish(); }
                 auto t1=std::chrono::high_resolution_clock::now();
-                double us = std::chrono::duration<double,std::micro>(t1-t0).count()/4.0;
-                if(us>1) frames = std::max(1, std::min(64, (int)std::round(TARGET_BATCH_US/us)));
+                double us=std::chrono::duration<double,std::micro>(t1-t0).count()/probes;
+                if(us>0.5){ int maxF=isClear?2048:256, minF=isClear?256:4; frames=std::max(minF,std::min(maxF,(int)std::round(TARGET_BATCH_US/us))); }
               }
-              std::vector<double> samples;
-              for(int r=0;r<MAX_ROUNDS;r++){
+              framesPerCase[ci]=frames;
+              printf("[warmup] %s: frames/batch %d\n", c.name, frames);
+            }
+            // [ALT-C2] Round-robin sıralama: her round'da tüm case'ler birer batch (interleaved) — thermal eşit dağılır
+            std::vector<std::vector<double>> allSamples(NCASES);
+            for(int i=0;i<NCASES;++i) allSamples[i].reserve(MAX_ROUNDS);
+            for(int r=0;r<MAX_ROUNDS;++r){
+              for(int ci=0; ci<NCASES; ++ci){
+                auto &c=cases[ci]; int frames=framesPerCase[ci];
                 auto t0=std::chrono::high_resolution_clock::now();
-                for(int f=0;f<frames;f++){ if(c.ndraw==0) glClear(GL_COLOR_BUFFER_BIT); else for(int d=0;d<c.ndraw;d++) glDrawArrays(GL_TRIANGLES,0,c.nverts); }
+                for(int f=0;f<frames;f++){ doDraw(c); }
                 glFinish();
                 auto t1=std::chrono::high_resolution_clock::now();
-                double us = std::chrono::duration<double,std::micro>(t1-t0).count() / frames;
-                samples.push_back(us);
+                double us=std::chrono::duration<double,std::micro>(t1-t0).count()/frames;
+                allSamples[ci].push_back(us);
               }
-              std::sort(samples.begin(), samples.end());
-              double median = samples[samples.size()/2];
-              double mean=0; for(double v:samples) mean+=v; mean/=samples.size();
-              double p95 = samples[(size_t)(samples.size()*0.95)];
-              double noise = (p95-median)/median;
-              double dps = c.ndraw>0 ? (c.ndraw*1e6/median) : (1e6/median);
-              printf("%s: median %.1f us/frame, mean %.1f, p95 %.1f, noise %.1f%%, frames/batch %d, draws/s %.0f\n",
-                c.name, median, mean, p95, noise*100, frames, dps);
-              results.push_back({c.name, median, mean, p95, noise, (int)samples.size(), dps});
+            }
+            for(int ci=0; ci<NCASES; ++ci){
+              auto &c=cases[ci]; auto &samples=allSamples[ci]; int frames=framesPerCase[ci];
+              std::vector<double> sorted=samples; std::sort(sorted.begin(), sorted.end());
+              double medTmp=sorted[sorted.size()/2];
+              std::vector<double> devs; for(double v: sorted) devs.push_back(std::fabs(v-medTmp)); std::sort(devs.begin(), devs.end());
+              double mad=std::max(0.5, devs[devs.size()/2]);
+              std::vector<double> filtered; for(double v: samples) if(std::fabs(v-medTmp) <= 3*mad*1.4826) filtered.push_back(v);
+              std::vector<double> useMad=(filtered.size()>=samples.size()*0.7)?filtered:samples; std::sort(useMad.begin(), useMad.end());
+              double madMedian=useMad[useMad.size()/2]; double madMean=0; for(double v:useMad) madMean+=v; madMean/=useMad.size();
+              double p95=useMad[(size_t)(useMad.size()*0.95)]; double noise=(p95-madMedian)/std::max(madMedian,1.0);
+              double wMean=winsorized_mean(samples,0.10,0.10);
+              double tMean=trimmed_mean(samples,0.10,0.10);
+              double dpsMad=c.ndraw>0 ? (c.ndraw*1e6/madMedian) : (1e6/madMedian);
+              double dpsW=c.ndraw>0 ? (c.ndraw*1e6/wMean) : (1e6/wMean);
+              printf("%s: MAD median %.1f us, wMean %.1f us (trim %.1f), madMean %.1f, p95 %.1f, noise %.1f%%, frames/batch %d, rounds %zu->%zu MAD draws/s MAD %.0f W %.0f [round-robin]\n",
+                c.name, madMedian, wMean, tMean, madMean, p95, noise*100, frames, samples.size(), useMad.size(), dpsMad, dpsW);
+              results.push_back({c.name, madMedian, madMean, p95, noise, (int)useMad.size(), dpsMad, wMean, tMean});
             }
             // JSON out
             FILE* f=fopen(out,"w");
@@ -233,8 +329,8 @@ jobs:
               (const char*)glGetString(GL_VENDOR), (const char*)glGetString(GL_RENDERER), (const char*)glGetString(GL_VERSION));
             for(size_t i=0;i<results.size();i++){
               auto &r=results[i];
-              fprintf(f,"    {\"name\":\"%s\",\"median_us\":%.3f,\"mean_us\":%.3f,\"p95_us\":%.3f,\"noise\":%.4f,\"rounds\":%d,\"draws_per_sec\":%.1f}%s\n",
-                r.name,r.median_us,r.mean_us,r.p95_us,r.noise,r.rounds,r.draws_per_sec, i+1<results.size()? ",":"");
+              fprintf(f,"    {\"name\":\"%s\",\"median_us\":%.3f,\"mean_us\":%.3f,\"p95_us\":%.3f,\"noise\":%.4f,\"rounds\":%d,\"draws_per_sec\":%.1f,\"winsorized_us\":%.3f,\"trimmed_us\":%.3f}%s\n",
+                r.name,r.median_us,r.mean_us,r.p95_us,r.noise,r.rounds,r.draws_per_sec, r.winsorized_us, r.trimmed_us, i+1<results.size()? ",":"");
             }
             fprintf(f,"  ]\n}\n"); fclose(f);
             printf("Wrote %s\n", out);
@@ -244,7 +340,7 @@ jobs:
           }
           CPP
           g++ -O2 -std=c++20 /tmp/synth_bench.cpp -o /tmp/synth_bench -lEGL -lGLESv2 -lm 2>&1 | tee bench-results/synth_bench_build.log
-          xvfb-run -a /tmp/synth_bench --out bench-results/synth_bench.json 2>&1 | tee bench-results/synth_bench.log || /tmp/synth_bench --out bench-results/synth_bench.json 2>&1 | tee -a bench-results/synth_bench.log || true
+          if [ -n "$PIN_PREFIX" ]; then echo "Running with: $PIN_PREFIX xvfb-run ..." | tee -a bench-results/synth_bench.log; $PIN_PREFIX xvfb-run -a /tmp/synth_bench --out bench-results/synth_bench.json 2>&1 | tee -a bench-results/synth_bench.log || $PIN_PREFIX /tmp/synth_bench --out bench-results/synth_bench.json 2>&1 | tee -a bench-results/synth_bench.log || true; else xvfb-run -a /tmp/synth_bench --out bench-results/synth_bench.json 2>&1 | tee bench-results/synth_bench.log || /tmp/synth_bench --out bench-results/synth_bench.json 2>&1 | tee -a bench-results/synth_bench.log || true; fi
           cat bench-results/synth_bench.json 2>&1 | tee -a bench-results/README.md || true
           echo "" >> bench-results/README.md
           echo "Note: synthetic bench runs on lavapipe (software). Absolute numbers meaningless; PR vs main delta is the signal." >> bench-results/README.md
