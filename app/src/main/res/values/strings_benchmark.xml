@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Holy MobileGlues — Benchmark stringleri (EN). Kaynak: ZalithLauncher2Plus strings.xml + MobileGlues-plugin md_bench_* -->
+<resources>
+    <!-- Holy benchmark — Plus ile aynı key'ler, EN orijinal -->
+    <string name="benchmark_title">GPU Karşılaştırması</string>
+    <string name="benchmark_run">Testi Başlat</string>
+    <string name="benchmark_running">Test ediliyor… %d sn kaldı</string>
+    <string name="benchmark_result_avg">Ort. FPS</string>
+    <string name="benchmark_result_min">Min FPS</string>
+    <string name="benchmark_result_p99">%99 FPS</string>
+    <string name="benchmark_result_stability">Kararlılık</string>
+    <string name="benchmark_result_score">Puan</string>
+    <string name="benchmark_note">Ham GPU çizim (draw-call) verimi — 500 dörtgen × 15 sn. Yüksek puan = daha iyi renderer payı.</string>
+    <string name="benchmark_select_renderers">Karşılaştırılacak rendererları seç</string>
+    <string name="benchmark_select_all">Tümünü seç</string>
+    <string name="benchmark_deselect_all">Seçimi kaldır</string>
+    <string name="benchmark_select_minimum">Başlamak için en az 1 renderer seç</string>
+    <string name="benchmark_start">Başlat</string>
+    <string name="benchmark_running_renderer">Test ediliyor: %s</string>
+    <string name="benchmark_progress_of">%1$d / %2$d</string>
+    <string name="benchmark_comparison_title">Karşılaştırma Sonuçları</string>
+    <string name="benchmark_score_label">Puan: %d</string>
+    <string name="benchmark_col_renderer">Renderer</string>
+    <string name="benchmark_col_avg">Ort.</string>
+    <string name="benchmark_col_min">Min</string>
+    <string name="benchmark_col_p99">%99</string>
+    <string name="benchmark_col_stab">Karar.</string>
+    <string name="benchmark_run_again">Tekrar test et</string>
+
+    <!-- Generic (Plus'ta zaten var; Holy plugin'de yoksa ekle) -->
+    <string name="generic_cancel">İptal</string>
+    <string name="generic_close">Kapat</string>
+
+    <!-- MobileGlues multidraw bench Türkçe (MGBench / md_bench_*) — plugin'de EN vardı, TR ek -->
+    <string name="md_bench_run_all">Tümünü test et</string>
+    <string name="md_bench_run_entry">Bunu test et</string>
+    <string name="md_bench_running_title">Karşılaştırma</string>
+    <string name="md_bench_running_msg">Her strateji sırayla ölçülüyor. Temel bütçe ~8 sn; kararsızsa sahne büyütülüp tekrar ölçülür, bu yüzden ısınmış cihazda birkaç dakika sürebilir. Ekran açık tutulur.</string>
+    <string name="md_bench_result_title">Sonuçlar</string>
+    <string name="md_bench_outdated">Grafik sürücüsü değişti. Mevcut sıralama eski sürücüde ölçülmüştü — tekrar test önerilir.</string>
+    <string name="md_home_untuned">MultiDraw varsayılan sırada</string>
+    <string name="md_home_untuned_desc">Varsayılan sıra genel ortalamaya göre; bu cihazda en hızlısı ölçerek bulunur.</string>
+</resources>

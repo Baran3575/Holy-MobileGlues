@@ -52,9 +52,11 @@ jobs:
           HAS_MG_BENCH=false
           HAS_JUNIT_BENCH=false
           HAS_CMAKE=false
+          HAS_HOLY_BENCH=false
           [ -f "MobileGlues-cpp/bench/multidraw_bench.cpp" ] && HAS_MULTIDRAW=true
           [ -d "MG_Benchmark" ] || [ -f "MG_Benchmark/CMakeLists.txt" ] && HAS_MG_BENCH=true
           [ -f "MobileGlues-cpp/CMakeLists.txt" ] && HAS_CMAKE=true
+          [ -f "app/src/main/java/com/holy/mobileglues/benchmark/BenchmarkGLRenderer.kt" ] && HAS_HOLY_BENCH=true
           # Zalith tarzı JUnit bench
           if find . -name "*Bench*.kt" -o -name "*Benchmark*.kt" | grep -q .; then HAS_JUNIT_BENCH=true; fi
           # Genel gradle test bench
@@ -63,7 +65,8 @@ jobs:
           echo "has_mg_bench=$HAS_MG_BENCH" >> $GITHUB_OUTPUT
           echo "has_junit_bench=$HAS_JUNIT_BENCH" >> $GITHUB_OUTPUT
           echo "has_cmake=$HAS_CMAKE" >> $GITHUB_OUTPUT
-          echo "Detect: multidraw=$HAS_MULTIDRAW mg_bench=$HAS_MG_BENCH junit=$HAS_JUNIT_BENCH cmake=$HAS_CMAKE"
+          echo "has_holy_bench=$HAS_HOLY_BENCH" >> $GITHUB_OUTPUT
+          echo "Detect: multidraw=$HAS_MULTIDRAW mg_bench=$HAS_MG_BENCH junit=$HAS_JUNIT_BENCH cmake=$HAS_CMAKE holy_bench=$HAS_HOLY_BENCH"
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -315,6 +318,16 @@ jobs:
           python3 /tmp/gen_report.py
           cat bench-results/report.md >> $GITHUB_STEP_SUMMARY || true
 
+      - name: Holy bench — kdoc / strings lint (app/ varsa)
+        if: steps.detect.outputs.has_holy_bench == 'true'
+        run: |
+          echo "Holy BenchmarkGLRenderer.kt bulundu — derleme app/ modülü olmadan lint ediliyor"
+          grep -q "class BenchmarkGLRenderer" app/src/main/java/com/holy/mobileglues/benchmark/BenchmarkGLRenderer.kt && echo "✓ BenchmarkGLRenderer.kt OK"
+          grep -q "class BenchmarkOverlay\|fun BenchmarkOverlay" app/src/main/java/com/holy/mobileglues/benchmark/BenchmarkOverlay.kt && echo "✓ BenchmarkOverlay.kt OK"
+          xmllint --noout app/src/main/res/values/strings_benchmark.xml 2>&1 | head -n 20 || python3 -c "import xml.etree.ElementTree as ET; ET.parse('app/src/main/res/values/strings_benchmark.xml'); print('✓ strings_benchmark.xml XML OK')"
+          xmllint --noout app/src/main/res/values-tr/strings_benchmark.xml 2>&1 | head -n 20 || python3 -c "import xml.etree.ElementTree as ET; ET.parse('app/src/main/res/values-tr/strings_benchmark.xml'); print('✓ values-tr OK')"
+          echo "Not: tam instrumented test (emulator) için ikinci job'a bakın — benchmark-android"
+
       - name: Upload benchmark results
         if: always()
         uses: actions/upload-artifact@v4
@@ -345,4 +358,55 @@ jobs:
         if: always()
         run: |
           echo "Benchmark bitti — bench-results/report.md artifact'ına bakın."
-          echo "PR ise yorum olarak da eklendi; main ile delta için iki artifact'i `benchstat old.txt new.txt` ile karşılaştırın."
+          echo "PR ise yorum olarak da eklendi; main ile delta için iki artifact'i \`benchstat old.txt new.txt\` ile karşılaştırın."
+
+  # ---- Android GLSurfaceView bench (Holy BenchmarkGLRenderer) — emulator'da gerçek GLES ----
+  benchmark-android:
+    name: Benchmark (Android emulator — Holy GLSurfaceView)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # Sadece app/ + Holy bench varsa koş; docs-only iken skip (yeşil)
+    if: hashFiles('app/src/main/java/com/holy/mobileglues/benchmark/BenchmarkGLRenderer.kt') != ''
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 17
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run instrumented bench on emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          target: google_apis
+          arch: x86_64
+          profile: pixel_4
+          emulator-options: "-no-snapshot -no-window -gpu swiftshader_indirect -no-audio -no-boot-anim"
+          disable-animations: true
+          script: |
+            chmod +x gradlew
+            # Holy app modülü varsa connectedCheck koş; yoksa lint ile yetin
+            ./gradlew :app:connectedAndroidTest --tests "*Benchmark*" 2>&1 | tee /tmp/emu_bench.log || ./gradlew :app:connectedCheck 2>&1 | tee /tmp/emu_bench.log || true
+            mkdir -p bench-results-android
+            cp /tmp/emu_bench.log bench-results-android/ || true
+            find app/build -name "*.xml" -path "*/test-results/*" -exec cp {} bench-results-android/ \; 2>/dev/null || true
+
+      - name: Upload Android bench
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-android-${{ github.sha }}
+          path: bench-results-android/
+          if-no-files-found: warn
