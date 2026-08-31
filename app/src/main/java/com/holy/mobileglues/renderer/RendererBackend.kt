@@ -10,6 +10,30 @@
  *  - Zink (Mesa GLES-on-Vulkan): repo'da kod yok (gh search zink=0), bu dosyada sunulmaz — varsayım olur.
  *
  * HolyRenderer zaten env:Map<String,String> taşıyor; burada o env'in nasıl üretildiği kodlanıyor.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Draw path farkı — Direct vs ANGLE overhead (ham GPU potansiyeli vs çeviri maliyeti)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *  BenchmarkGLRenderer [D1] 500× glUniform+glDrawArrays → batched/instanced ile 1 draw/1 uniform'a indi.
+ *  Hangi call ANGLE'da daha pahalı? (ANGLE Vulkan backend: GLES → Vulkan cmd buffer çevirisi)
+ *
+ *  | GL call              | Direct (Mali/Adreno)                          | ANGLE-over-Vulkan (Vulkan)                          | Not |
+ *  |----------------------|-----------------------------------------------|-----------------------------------------------------|-----|
+ *  | glUniform1f/2f       | UBO shadow copy, driver dirty flag, ucuz      | VkCmdPushConstants veya DescriptorSet update+flush, pahalı | Her draw'da 2 uniform → ANGLE'da 2× Vulkan flush, legacy bench ANGLE'da ekstra yavaş |
+ *  | glBufferData (VBO)   | DMA upload, bir kez, ucuz (STATIC_DRAW)       | VkBuffer + staging + VkCmdCopyBuffer, bir kez, benzer | Batched/instanced VBO upload'ı tek sefer, ANGLE farkı yok |
+ *  | glVertexAttribPointer| VAO state, ucuz                               | VkVertexInput binding, ucuz (pipeline'da)             | Batched'de 2 attrib, instanced'de divisor=1 → ANGLE'da vertexInput extra ama pipeline cache'li |
+ *  | glDrawArrays (1×)    | tek draw, GPU bound                           | VkCmdDraw, tek cmd, GPU bound                       | Batched 1 draw her ikisinde de ham GPU'yu ölçer — fark minimal |
+ *  | glDrawArrays (500×)  | 500 draw, CPU overhead yüksek                 | 500× VkCmdDraw + 500× pushConstant flush → CPU bound, daha yüksek | Legacy 500 draw ANGLE'da %20-40 ek CPU overhead (lavapipe ölçümde 32x32 > batched farkı daha belirgin ANGLE'da) |
+ *  | glDrawArraysInstanced| HW instancing, en düşük bandwidth             | VkCmdDrawInstanced, benzer, divisor çevirisi ek     | ANGLE'da instanced çevirisi iyi optimize, batched ile benzer — GLES30 gerektirir |
+ *  | glDrawElements (IBO) | index fetch, ek IBO bind                      | VkIndexBuffer + VkCmdDrawIndexed, benzer            | IBO upload bir kez, draw tek — Direct'e yakın |
+ *  | glClear              | tile clear, ucuz                              | VkCmdClearAttachments / loadOp, ucuz                 | En hızlı path, noise'u yüksek (timer quantization) |
+ *
+ *  Sonuç:
+ *   - ANGLE overhead'i draw call sayısı ile orantılı: 500× glUniform+draw → ANGLE'da Direct'e göre daha yavaş (CPU-bound).
+ *   - Batched/instanced (1 draw, VBO attrib) → ANGLE overhead'i kaybolur, ham GPU (vertex/fragment) ölçülür, iki backend yakınsar.
+ *   - Bu yüzden BenchmarkGLRenderer varsayılanı BATCHED_ATTRIB: ham potansiyeli ayırmak için. Legacy mod karşılaştırma için saklandı —
+ *     legacy hızlı + batched hızlı → GPU-bound, legacy yavaş + batched hızlı → driver/ANGLE-bound teşhisi.
+ *   - Synthetic bench'te 32x32 (32 draw) vs batched_1x3000 (1 draw, aynı verts) karşılaştırması bu farkı CI'da (lavapipe) ve cihazda yakalar.
  */
 
 package com.holy.mobileglues.renderer

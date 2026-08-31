@@ -12,6 +12,7 @@ package com.holy.mobileglues.benchmark
 
 import android.opengl.GLSurfaceView
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -47,7 +48,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -253,6 +257,50 @@ private fun RunningPhase(
     Button(onClick = onCancel) { Text(stringResource(R.string.generic_cancel)) }
 }
 
+/** [ALT] Frame time sparkline — minimum FPS için mini-grafik (frameTimes ms) */
+@Composable
+private fun FrameTimeSparkline(
+    frameTimesMs: List<Double>,
+    medianMs: Double,
+    modifier: Modifier = Modifier,
+) {
+    if (frameTimesMs.isEmpty()) return
+    val minMs = frameTimesMs.minOrNull() ?: 0.0
+    val maxMs = frameTimesMs.maxOrNull() ?: 1.0
+    val range = (maxMs - minMs).coerceAtLeast(0.5)
+    val medianY = ((medianMs - minMs) / range).toFloat()
+    Canvas(modifier = modifier.height(28.dp).fillMaxWidth().background(Color(0xFF1A1A2E), shape = androidx.compose.foundation.shape.RoundedCornerShape(4.dp)).padding(2.dp)) {
+        val w = size.width
+        val h = size.height
+        // median çizgisi
+        drawLine(
+            color = Color(0xFF4CAF50).copy(alpha = 0.6f),
+            start = Offset(0f, h * (1f - medianY)),
+            end = Offset(w, h * (1f - medianY)),
+            strokeWidth = 1f
+        )
+        // sparkline path
+        if (frameTimesMs.size >= 2) {
+            val path = Path()
+            frameTimesMs.forEachIndexed { idx, ms ->
+                val x = idx.toFloat() / (frameTimesMs.size - 1).toFloat() * w
+                val y = h * (1f - ((ms - minMs) / range).toFloat())
+                if (idx == 0) path.moveTo(x, y) else path.lineTo(x, y)
+            }
+            drawPath(path, color = Color(0xFF90CAF9), style = Stroke(width = 1.6f))
+            // jank eşiği üstü noktalar kırmızı
+            val jankThresh = medianMs * 1.5
+            frameTimesMs.forEachIndexed { idx, ms ->
+                if (ms > jankThresh) {
+                    val x = idx.toFloat() / (frameTimesMs.size - 1).toFloat() * w
+                    val y = h * (1f - ((ms - minMs) / range).toFloat())
+                    drawCircle(color = Color(0xFFE53935), radius = 1.8f, center = Offset(x, y))
+                }
+            }
+        }
+    }
+}
+
 @Composable
 private fun ResultsPhase(
     results: List<HolyBenchmarkResult>,
@@ -269,34 +317,121 @@ private fun ResultsPhase(
                 val isWinner = r.result.score == maxScore && results.size > 1
                 // Stabilite düşükse ham potansiyel gizlenmiş — kullanıcıya göster
                 val isUnstable = r.result.stabilityPct < 70
+                // [S10+] Min FPS ham potansiyel kadar kritik — renk kodlama
+                val minRatio = r.result.minMedianRatioPct.takeIf { it != 0 } ?: run {
+                    val med = r.result.medianFps.coerceAtLeast(1)
+                    (r.result.minFps * 100 / med).coerceIn(0, 100)
+                }
+                val isSevereMin = minRatio < 60
+                val isModerateMin = minRatio in 60..74
+                val isGoodMin = minRatio >= 85
+                val jank = r.result.jankPct
+                val isHighJank = jank > 10
+                val vsync = r.result.vsyncLimited
+                val thermalDrop = r.result.thermalDropPct
+                val isThermal = thermalDrop > 12
                 Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                        Text(text = r.rendererName + if (isWinner) " 🏆" else "" + if (isUnstable) " ⚠️" else "", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text(stringResource(R.string.benchmark_score_label, r.result.score), style = MaterialTheme.typography.bodyMedium, color = if (isUnstable) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                        val suffix = buildString {
+                            if (isWinner) append(" 🏆")
+                            if (isUnstable) append(" ⚠️")
+                            if (isSevereMin) append(" 🧊")
+                            if (vsync) append(" 🔒")
+                        }
+                        Text(text = r.rendererName + suffix, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        val scoreColor = when {
+                            isSevereMin || isUnstable -> MaterialTheme.colorScheme.error
+                            isModerateMin || isHighJank -> Color(0xFF9C5700) // amber — dikkat
+                            else -> MaterialTheme.colorScheme.primary
+                        }
+                        Text(stringResource(R.string.benchmark_score_label, r.result.score), style = MaterialTheme.typography.bodyMedium, color = scoreColor, fontWeight = FontWeight.Bold)
                     }
                     LinearProgressIndicator(progress = { r.result.score.toFloat() / maxScore.toFloat() }, modifier = Modifier.fillMaxWidth().height(8.dp))
-                    // Kararsızsa ham median vs min farkını göster — "cihaz performansı dalgalı" sinyali
+                    // Min/median bar — pacing görseli (kuadratik skorun kaynağı)
+                    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("Min/Med", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+                        val minColor = when {
+                            isSevereMin -> MaterialTheme.colorScheme.error
+                            isModerateMin -> Color(0xFF9C5700)
+                            isGoodMin -> Color(0xFF2E7D32)
+                            else -> MaterialTheme.colorScheme.outline
+                        }
+                        Box(modifier = Modifier.weight(1f).height(6.dp).background(MaterialTheme.colorScheme.surfaceVariant)) {
+                            Box(modifier = Modifier.fillMaxWidth(minRatio / 100f).height(6.dp).background(minColor))
+                        }
+                        Text("$minRatio%", style = MaterialTheme.typography.labelSmall, color = minColor, fontWeight = FontWeight.Bold)
+                        if (jank > 0) Text("jank $jank%", style = MaterialTheme.typography.labelSmall, color = if (isHighJank) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.outline)
+                    }
+                    // Uyarılar — hiyerarşi: thermal > severe min > instability > jank > vsync
+                    if (isSevereMin) {
+                        Text("⛔ Minimum FPS çok düşük (%$minRatio, ${r.result.minFps} FPS) — kare takılmaları oynanışı bozar. Ham median ${r.result.medianFps} yüksek olsa da skor kuadratik cezalı (median×stab²). Soğut, arka planı kapat, tekrar dene.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.SemiBold)
+                    } else if (isModerateMin) {
+                        Text("⚠️ Minimum FPS dalgalı (%$minRatio, min ${r.result.minFps} vs med ${r.result.medianFps}) — ara sıra takılma var. Skor min/median ile cezalı.", style = MaterialTheme.typography.labelSmall, color = Color(0xFF9C5700))
+                    }
                     if (isUnstable) {
-                        Text("Kararlılık düşük (%${r.result.stabilityPct}) — sonuç ısınma/DVFS'ten etkilenmiş olabilir. Kılıfı çıkar, 2 dk bekle, tekrar dene.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+                        Text("Kararlılık düşük (%${r.result.stabilityPct}, noise %${r.result.noisePct}) — sonuç ısınma/DVFS'ten etkilenmiş olabilir. Kılıfı çıkar, 2 dk bekle, tekrar dene.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+                    }
+                    if (isHighJank) {
+                        Text("Frame pacing bozuk — karelerin %$jank'i median*1.5 üstünde (takılma). Pacing skoru %${r.result.pacingScore}.", style = MaterialTheme.typography.labelSmall, color = Color(0xFF9C5700))
+                    }
+                    if (isThermal) {
+                        Text("🌡️ Thermal throttling şüphesi — ikinci yarı %$thermalDrop daha yavaş. Cihaz ısınmış; soğutup tekrar dene.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+                    }
+                    if (vsync) {
+                        Text("🔒 V-sync tavanına takılı görünüyor (≈${r.result.medianFps} FPS, stab %${r.result.stabilityPct}) — ham GPU potansiyeli daha yüksek olabilir; skor vsync dahil.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+                    }
+                    // [ALT] Harmonic skor bilgisi — median kuadratik vs harmonic lineer karşılaştırması
+                    if (r.result.harmonicFps > 0) {
+                        val harmColor = if (r.result.harmonicWeightPct < 70) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.outline
+                        Text("〰 Harmonic: ${r.result.harmonicFps} FPS (min/harm ${r.result.harmonicWeightPct}%, skor ${r.result.harmonicScore}) — düşük karelere daha duyarlı, median ${r.result.medianFps} ile karşılaştır", style = MaterialTheme.typography.labelSmall, color = harmColor)
+                    }
+                    if (r.result.vsyncOffAttempted) {
+                        val vsyncOffText = if (r.result.vsyncOffSuccess) "✓ V-sync kapatma denendi ve başarılı (swapInterval 0)" else "✗ V-sync kapatma denendi ama başarısız — ölçüm vsync dahil (ALT-T1 triple-buffer notu)"
+                        Text(vsyncOffText, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+                    }
+                    if (r.result.presentationCorrected) {
+                        Text("◐ Presentation time düzeltmesi uygulandı (vsync kuantizasyon ~%8 azaltıldı)", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+                    }
+                    // [ALT] Sparkline mini-grafik — frameTimes kronolojik
+                    if (r.result.sparklineMs.isNotEmpty()) {
+                        val sparkMs = r.result.sparklineMs
+                        val medMs = 1000.0 / r.result.medianFps.coerceAtLeast(1)
+                        FrameTimeSparkline(frameTimesMs = sparkMs, medianMs = medMs, modifier = Modifier.fillMaxWidth().padding(top = 2.dp))
+                        Text("frameTime sparkline — yeşil = median, kırmızı nokta = jank (median×1.5 üstü), ${sparkMs.size} kare", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
                     }
                 }
             }
             HorizontalDivider()
             Row(modifier = Modifier.fillMaxWidth()) {
-                Text(stringResource(R.string.benchmark_col_renderer), style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(2f))
+                Text(stringResource(R.string.benchmark_col_renderer), style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1.9f))
                 listOf(R.string.benchmark_col_avg, R.string.benchmark_col_min, R.string.benchmark_col_p99, R.string.benchmark_col_stab).forEach { col ->
                     Text(stringResource(col), style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f), textAlign = TextAlign.Center)
                 }
             }
             sorted.forEach { r ->
+                val minRatioRow = r.result.minMedianRatioPct.takeIf { it != 0 } ?: (r.result.minFps * 100 / r.result.medianFps.coerceAtLeast(1))
+                val minCellColor = when {
+                    minRatioRow < 60 -> MaterialTheme.colorScheme.error
+                    minRatioRow < 75 -> Color(0xFF9C5700)
+                    minRatioRow >= 85 -> Color(0xFF2E7D32)
+                    else -> MaterialTheme.colorScheme.onSurface
+                }
                 Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text(r.rendererName, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(2f), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    listOf("${r.result.medianFps}(${r.result.avgFps})", "${r.result.minFps}", "${r.result.p99Fps}", "${r.result.stabilityPct}%").forEach { v ->
-                        Text(v, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f), textAlign = TextAlign.Center)
+                    Text(r.rendererName, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1.9f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text("${r.result.medianFps}(${r.result.avgFps})", style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f), textAlign = TextAlign.Center)
+                    Text("${r.result.minFps}", style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f), textAlign = TextAlign.Center, color = minCellColor, fontWeight = if (minRatioRow < 75) FontWeight.Bold else FontWeight.Normal)
+                    Text("${r.result.p99Fps}", style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f), textAlign = TextAlign.Center)
+                    Text("${r.result.stabilityPct}%", style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f), textAlign = TextAlign.Center, color = if (r.result.stabilityPct < 70) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
+                }
+                // Ek satır: pacing/thermal/vsync detay — tabloyu şişirmeden tek satır
+                if (r.result.jankPct > 0 || r.result.thermalDropPct > 0 || r.result.vsyncLimited) {
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("", modifier = Modifier.weight(1.9f))
+                        Text("min/med ${minRatioRow}%  jank ${r.result.jankPct}%${if (r.result.vsyncLimited) "  vsync🔒" else ""}${if (r.result.thermalDropPct > 0) "  th ${r.result.thermalDropPct}%" else ""}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline, modifier = Modifier.weight(3f), textAlign = TextAlign.Center)
                     }
                 }
             }
-            Text("Ort. = eski ortalama, parantez dışı = median (kararlı ham potansiyel). Kararsızlık yüksekse median'a bak.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
+            Text("Ort. = eski ortalama, parantez dışı = median (kararlı ham potansiyel). Min FPS hücre rengi: yeşil ≥85% / turuncu 60-74% / kırmızı <60% (min/median). Skor = median×(stab/100)² — min düşükse kuadratik ceza.", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline)
             Text(stringResource(R.string.benchmark_note), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.outline, modifier = Modifier.padding(top = 4.dp))
         }
     }
